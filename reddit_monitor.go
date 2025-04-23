@@ -1,14 +1,19 @@
 package main
 
 import (
+	"context" // Needed for MongoDB operations
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/smtp" // Added for sending email
-	"os"       // Added for file operations
+	"os"       // Added for file operations and env vars
 	"regexp"   // Added for regex matching
 	"strings"
 	"time"
+
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref" // For pinging
 )
 
 // Post represents a Reddit post's relevant fields
@@ -55,61 +60,47 @@ var gmailUser = os.Getenv("GMAIL_USER")
 var gmailAppPassword = os.Getenv("GMAIL_APP_PASSWORD") // Use an App Password for Gmail
 var recipientEmail = os.Getenv("RECIPIENT_EMAIL")
 
+var mongoURI = os.Getenv("MONGODB_URI") // MongoDB Connection String
+
 // --- Internal Setup ---
 var combinedSubreddits = strings.Join(subreddits, "+") // Keep this dynamic based on subreddits var
 var postEndpoint = fmt.Sprintf("https://www.reddit.com/r/%s/new/.json?limit=100", combinedSubreddits)
 var commentEndpoint = fmt.Sprintf("https://www.reddit.com/r/%s/comments/.json?limit=100", combinedSubreddits)
 
-// Processed Item Tracking
-var processedIDs = make(map[string]bool) // Use Permalink as the key
-var processedIDsFile = os.Getenv("PROCESSED_IDS_PATH") // Read path from env var
+// Processed Item Tracking (MongoDB)
+var mongoClient *mongo.Client
+var processedItemsCollection *mongo.Collection
 
-// Note: Timestamp tracking is removed as ID tracking is more robust for preventing duplicates.
+// Note: Persistence now handled by MongoDB
 
 // HTTP Client with custom User-Agent
 var httpClient = &http.Client{Timeout: 10 * time.Second} // Add a timeout
 var userAgent = "GoRedditMonitor/1.0 (by /u/YourRedditUsername)" // CHANGE YourRedditUsername if possible
 
-// --- Persistence Functions ---
+// --- MongoDB Setup ---
 
-// loadProcessedIDs loads the set of processed item permalinks from a JSON file.
-func loadProcessedIDs(filename string) error {
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// File doesn't exist, start with an empty set (first run)
-			fmt.Println("Processed IDs file not found, starting fresh.")
-			processedIDs = make(map[string]bool)
-			return nil
-		}
-		// Other read error
-		return fmt.Errorf("error reading processed IDs file: %w", err)
+// setupMongoIndex ensures a unique index exists on the permalink field for efficient lookups.
+// Run this in a goroutine from main to avoid blocking startup.
+func setupMongoIndex() {
+	if processedItemsCollection == nil {
+		fmt.Println("WARN: Cannot setup index, MongoDB collection is nil.")
+		return
 	}
-
-	// File exists, unmarshal the JSON data
-	err = json.Unmarshal(data, &processedIDs)
-	if err != nil {
-		return fmt.Errorf("error unmarshalling processed IDs: %w", err)
+	// Create a unique index on the 'permalink' field
+	indexModel := mongo.IndexModel{
+		Keys:    map[string]interface{}{"permalink": 1}, // 1 for ascending
+		Options: options.Index().SetUnique(true),
 	}
-	fmt.Printf("Loaded %d processed IDs.\n", len(processedIDs))
-	return nil
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	indexName, err := processedItemsCollection.Indexes().CreateOne(ctx, indexModel)
+	if err != nil {
+		// Log error, but maybe don't make it fatal? Index might exist or other issues.
+		fmt.Printf("WARN: Could not create/verify MongoDB index (may already exist): %v\n", err)
+	} else {
+		fmt.Printf("MongoDB index '%s' on 'permalink' ensured.\n", indexName)
+	}
 }
-
-// saveProcessedIDs saves the current set of processed item permalinks to a JSON file.
-func saveProcessedIDs(filename string) error {
-	data, err := json.MarshalIndent(processedIDs, "", "  ") // Pretty print JSON
-	if err != nil {
-		return fmt.Errorf("error marshalling processed IDs: %w", err)
-	}
-
-	err = os.WriteFile(filename, data, 0644) // Write with standard permissions
-	if err != nil {
-		return fmt.Errorf("error writing processed IDs file: %w", err)
-	}
-	// fmt.Printf("Saved %d processed IDs.\n", len(processedIDs)) // Optional: Log saving
-	return nil
-}
-
 
 // --- Email Sending ---
 
@@ -236,14 +227,28 @@ func findKeywords(text string, keywords []string) []string {
 
 // processPosts checks posts for keywords, sends email for new matches, and tracks processed IDs.
 func processPosts(posts []Post) {
-	newMatchesFound := false
+	// newMatchesFound variable is less relevant now, DB handles state.
 	for _, post := range posts {
-		// Check if this post has already been processed
-		if _, exists := processedIDs[post.Permalink]; exists {
-			continue // Skip already processed post
-		}
 
-		// Check for keywords
+		// --- Check if already processed (MongoDB Query) ---
+		var result struct{} // We only care if a document is found, not its content
+		ctxFind, cancelFind := context.WithTimeout(context.Background(), 5*time.Second)
+		// FindOne returns ErrNoDocuments if not found
+		err := processedItemsCollection.FindOne(ctxFind, map[string]interface{}{"permalink": post.Permalink}).Decode(&result)
+		cancelFind() // Release context resources
+
+		if err == nil {
+			// Found the document, already processed
+			continue
+		} else if err != mongo.ErrNoDocuments {
+			// An actual error occurred during the query
+			fmt.Printf("Error checking MongoDB for post permalink %s: %v\n", post.Permalink, err)
+			continue // Skip this post on DB error
+		}
+		// If err == mongo.ErrNoDocuments, it means it's NOT processed, so proceed.
+		// --- End Check ---
+
+		// Check for keywords (same as before)
 		text := post.Title + " " + post.Selftext
 		found := findKeywords(text, keywords)
 
@@ -263,36 +268,54 @@ func processPosts(posts []Post) {
 				// Decide if you want to stop processing or just log the error
 				// continue // Optional: Continue processing other posts even if email fails
 			} else {
-				// Mark as processed ONLY if email was sent successfully (or if you choose to mark anyway)
-				processedIDs[post.Permalink] = true
-				newMatchesFound = true
+				// --- Mark as processed (MongoDB Insert) ---
+				ctxInsert, cancelInsert := context.WithTimeout(context.Background(), 5*time.Second)
+				_, insertErr := processedItemsCollection.InsertOne(ctxInsert, map[string]interface{}{
+					"permalink":    post.Permalink,
+					"processed_at": time.Now(), // Store processing time
+				})
+				cancelInsert()
+
+				if insertErr != nil {
+					// Handle potential duplicate key error gracefully if index exists
+					// but the check somehow missed it (less likely with FindOne)
+					// Or other insertion errors
+					// If it's a duplicate key error (code 11000), we can often ignore it.
+					if mongo.IsDuplicateKeyError(insertErr) {
+						fmt.Printf("Info: Attempted to insert duplicate permalink %s, already processed.\n", post.Permalink)
+					} else {
+						fmt.Printf("Error inserting processed post permalink %s into MongoDB: %v\n", post.Permalink, insertErr)
+					}
+				}
+				// --- End Insert ---
 			}
 		}
-		// Note: We no longer track the max timestamp. We only care if the ID is new.
-		// We also add the ID even if no keywords are found IF we want to avoid re-checking
-		// non-matching posts in the future. For now, only adding matching ones.
-		// If you want to avoid re-checking *all* posts fetched, uncomment the next line:
-		// processedIDs[post.Permalink] = true
+		// No need to add to a map or save a file here
 	}
-	// Save IDs immediately after processing posts if new matches were added
-	if newMatchesFound {
-		err := saveProcessedIDs(processedIDsFile)
-		if err != nil {
-			fmt.Println("Error saving processed IDs after post processing:", err)
-		}
-	}
+	// No need for the final saveProcessedIDs call here
 }
 
 // processComments checks comments for keywords, sends email for new matches, and tracks processed IDs.
 func processComments(comments []Comment) {
-	newMatchesFound := false
+	// newMatchesFound variable is less relevant now, DB handles state.
 	for _, comment := range comments {
-		// Check if this comment has already been processed
-		if _, exists := processedIDs[comment.Permalink]; exists {
-			continue // Skip already processed comment
-		}
 
-		// Check for keywords
+		// --- Check if already processed (MongoDB Query) ---
+		var result struct{}
+		ctxFind, cancelFind := context.WithTimeout(context.Background(), 5*time.Second)
+		err := processedItemsCollection.FindOne(ctxFind, map[string]interface{}{"permalink": comment.Permalink}).Decode(&result)
+		cancelFind()
+
+		if err == nil {
+			continue // Already processed
+		} else if err != mongo.ErrNoDocuments {
+			fmt.Printf("Error checking MongoDB for comment permalink %s: %v\n", comment.Permalink, err)
+			continue // Skip on DB error
+		}
+		// Not processed, continue
+		// --- End Check ---
+
+		// Check for keywords (same as before)
 		found := findKeywords(comment.Body, keywords)
 
 		if len(found) > 0 {
@@ -310,21 +333,26 @@ func processComments(comments []Comment) {
 				fmt.Println("Error sending comment notification email:", err)
 				// continue // Optional: Continue processing other comments even if email fails
 			} else {
-				// Mark as processed ONLY if email was sent successfully
-				processedIDs[comment.Permalink] = true
-				newMatchesFound = true
+				// --- Mark as processed (MongoDB Insert) ---
+				ctxInsert, cancelInsert := context.WithTimeout(context.Background(), 5*time.Second)
+				_, insertErr := processedItemsCollection.InsertOne(ctxInsert, map[string]interface{}{
+					"permalink":    comment.Permalink,
+					"processed_at": time.Now(),
+				})
+				cancelInsert()
+
+				if insertErr != nil {
+					if mongo.IsDuplicateKeyError(insertErr) {
+						fmt.Printf("Info: Attempted to insert duplicate permalink %s, already processed.\n", comment.Permalink)
+					} else {
+						fmt.Printf("Error inserting processed comment permalink %s into MongoDB: %v\n", comment.Permalink, insertErr)
+					}
+				}
+				// --- End Insert ---
 			}
 		}
-		// Mark all checked comments as processed? Uncomment below if desired.
-		// processedIDs[comment.Permalink] = true
 	}
-	// Save IDs immediately after processing comments if new matches were added
-	if newMatchesFound {
-		err := saveProcessedIDs(processedIDsFile)
-		if err != nil {
-			fmt.Println("Error saving processed IDs after comment processing:", err)
-		}
-	}
+	// No need for the final saveProcessedIDs call here
 }
 
 func main() {
@@ -335,37 +363,68 @@ func main() {
 		fmt.Println("FATAL: Email environment variables (GMAIL_USER, GMAIL_APP_PASSWORD, RECIPIENT_EMAIL) must be set.")
 		os.Exit(1)
 	}
-	if processedIDsFile == "" {
-		fmt.Println("WARN: PROCESSED_IDS_PATH environment variable not set, defaulting to 'processed_ids.json'")
-		processedIDsFile = "processed_ids.json"
-		// If you require the path to be set, uncomment the lines below:
-		// fmt.Println("FATAL: PROCESSED_IDS_PATH environment variable must be set.")
-		// os.Exit(1)
+	if mongoURI == "" {
+		fmt.Println("FATAL: MONGODB_URI environment variable must be set.")
+		os.Exit(1)
 	}
+
+	// --- Connect to MongoDB ---
+	var err error
+	clientOptions := options.Client().ApplyURI(mongoURI)
+	ctxConnect, cancelConnect := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelConnect()
+	mongoClient, err = mongo.Connect(ctxConnect, clientOptions)
+	if err != nil {
+		fmt.Printf("FATAL: Unable to connect to MongoDB: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Ping the primary node to verify connection
+	ctxPing, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelPing()
+	err = mongoClient.Ping(ctxPing, readpref.Primary())
+	if err != nil {
+		fmt.Printf("FATAL: MongoDB ping failed: %v\n", err)
+		// Attempt to disconnect before exiting
+		_ = mongoClient.Disconnect(context.Background())
+		os.Exit(1)
+	}
+	fmt.Println("Successfully connected to MongoDB.")
+
+	// Get collection handle
+	// TODO: Consider making DB name and Collection name configurable via Env Vars too
+	processedItemsCollection = mongoClient.Database("reddit_monitor").Collection("processed_items")
+
+	// Ensure index exists (run in background)
+	go setupMongoIndex()
+
+	// Optional: Graceful shutdown handling
+	// Setup signal catching for SIGINT and SIGTERM
+	// sigs := make(chan os.Signal, 1)
+	// signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	// go func() {
+	// 	sig := <-sigs
+	// 	fmt.Println()
+	// 	fmt.Println("Received signal:", sig)
+	// 	fmt.Println("Disconnecting from MongoDB...")
+	// 	ctxDisconnect, cancelDisconnect := context.WithTimeout(context.Background(), 10*time.Second)
+	// 	defer cancelDisconnect()
+	// 	if err := mongoClient.Disconnect(ctxDisconnect); err != nil {
+	// 		fmt.Printf("Error during MongoDB disconnect: %v\n", err)
+	// 	}
+	// 	fmt.Println("MongoDB disconnected. Exiting.")
+	// 	os.Exit(0)
+	// }()
+
+
 	fmt.Println("--- Configuration ---")
 	fmt.Println("Monitoring subreddits:", subreddits)
 	fmt.Println("Looking for keywords:", keywords)
 	fmt.Println("Sending notifications to:", recipientEmail)
-	fmt.Println("Processed IDs file path:", processedIDsFile)
+	fmt.Println("Persistence: MongoDB")
 	fmt.Println("---------------------")
 
-	// Load previously processed IDs
-	err := loadProcessedIDs(processedIDsFile)
-	if err != nil {
-		fmt.Println("Error loading processed IDs, starting with empty set:", err)
-		// Continue even if loading fails, will just start fresh
-		processedIDs = make(map[string]bool)
-	}
-
-	// Initial save in case the file didn't exist and needs creation
-	// This ensures the file exists for subsequent saves within the loop.
-	// Only attempt save if path is valid or defaulted.
-	err = saveProcessedIDs(processedIDsFile)
-	if err != nil {
-		fmt.Println("Error performing initial save of processed IDs file:", err)
-		// Decide if this is critical enough to stop. For now, we continue.
-	}
-
+	// Remove old file loading/saving logic
 
 	for {
 		fmt.Println("\nFetching new data at", time.Now().Format(time.RFC1123))
