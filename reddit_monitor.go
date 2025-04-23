@@ -75,7 +75,7 @@ var processedItemsCollection *mongo.Collection
 
 // HTTP Client with custom User-Agent
 var httpClient = &http.Client{Timeout: 10 * time.Second} // Add a timeout
-var userAgent = "GoRedditMonitor/1.0 (by /u/YourRedditUsername)" // CHANGE YourRedditUsername if possible
+var userAgent = "GoKeywordMonitor/1.1 (by /u/Fawaazharden)" // Updated with actual Reddit username
 
 // --- MongoDB Setup ---
 
