@@ -1,5 +1,4 @@
 .git
-*.go
 processed_ids.json
 *.md
 Dockerfile
