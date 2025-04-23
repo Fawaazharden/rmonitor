@@ -1,0 +1,10 @@
+# Ignore compiled binaries
+reddit_monitor_linux
+reddit_monitor.exe
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore IDE/editor files (optional)
+.vscode/
